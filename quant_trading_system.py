@@ -29,7 +29,7 @@ DATA_FETCH_RETRIES = 3
 DATA_FETCH_RETRY_DELAY = 1.5
 
 # 数据源配置：默认改为 efinance（按你的反馈替换 AkShare）
-DATA_PROVIDERS = ["efinance", "akshare"]  # 按顺序故障转移
+DATA_PROVIDERS = ["eastmoney_direct", "efinance", "akshare"]  # 按顺序故障转移
 
 # 模型配置
 MODEL_NAME = "xgboost"  # linear / xgboost / lstm / transformer
@@ -106,6 +106,107 @@ class MarketDataProvider(Protocol):
     def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
         """获取历史K线并标准化为 date/open/high/low/close。"""
         ...
+
+
+
+
+class EastmoneyDirectDataProvider:
+    """东方财富直连数据源（requests直连，默认禁用系统代理）。"""
+
+    def __init__(self, disable_system_proxy: bool = True) -> None:
+        """初始化直连会话。
+
+        - disable_system_proxy=True 时，requests 不读取系统代理环境变量，
+          用于规避 `ProxyError: Unable to connect to proxy`。
+        """
+        import requests
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; QuantTradingSystem/1.0)",
+            "Referer": "https://quote.eastmoney.com/",
+        })
+        if disable_system_proxy:
+            self.session.trust_env = False
+
+    @staticmethod
+    def _secid(symbol: str) -> str:
+        """将A股代码转换为东财 secid。
+
+        上海: 1.xxx（60/68/11）
+        深圳: 0.xxx（其余A股常见前缀）
+        """
+        if symbol.startswith(("60", "68", "11")):
+            return f"1.{symbol}"
+        return f"0.{symbol}"
+
+    def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        """逐个股票拉取实时价格，避免全市场大请求。"""
+        result: Dict[str, float] = {}
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        for symbol in symbols:
+            params = {
+                "fltt": "2",
+                "invt": "2",
+                "fields": "f43",
+                "secid": self._secid(symbol),
+            }
+            r = self.session.get(url, params=params, timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            val = (((data or {}).get("data") or {}).get("f43"))
+            if val is None:
+                continue
+            # 东财价格通常放大100倍
+            price = float(val) / 100
+            if price > 0:
+                result[symbol] = price
+        return result
+
+    def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        """通过东财K线接口获取日线历史。"""
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": self._secid(symbol),
+            "klt": "101",  # 日线
+            "fqt": "1",    # 前复权
+            "lmt": str(max(lookback_days, 200)),
+            "end": "20500000",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        }
+        if start_date:
+            params["beg"] = start_date.replace("-", "")
+        else:
+            params["beg"] = "20100101"
+        if end_date:
+            params["end"] = end_date.replace("-", "")
+
+        r = self.session.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        klines = (((data or {}).get("data") or {}).get("klines")) or []
+        if not klines:
+            return pd.DataFrame()
+
+        rows = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 6:
+                continue
+            rows.append({
+                "date": parts[0],
+                "open": float(parts[1]),
+                "close": float(parts[2]),
+                "high": float(parts[3]),
+                "low": float(parts[4]),
+            })
+
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+        out["date"] = pd.to_datetime(out["date"])
+        return out[["date", "open", "high", "low", "close"]].sort_values("date").tail(lookback_days).reset_index(drop=True)
 
 
 class EFinanceDataProvider:
@@ -197,6 +298,8 @@ class AkshareDataProvider:
 
 def build_data_provider(name: str) -> MarketDataProvider:
     """按名称构建数据源实现实例。"""
+    if name.lower() == "eastmoney_direct":
+        return EastmoneyDirectDataProvider(disable_system_proxy=True)
     if name.lower() == "efinance":
         return EFinanceDataProvider()
     if name.lower() == "akshare":
@@ -214,7 +317,7 @@ def _normalize_provider_names(names: list[str]) -> list[str]:
             continue
         seen.add(k)
         out.append(k)
-    return out or ["efinance", "akshare"]
+    return out or ["eastmoney_direct", "efinance", "akshare"]
 
 
 class QuantTradingSystem:

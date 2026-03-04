@@ -3,12 +3,13 @@
 你反馈的报错本质是：数据源接口返回了非预期内容（如空响应/反爬页面），导致 JSON 解析失败。  
 本次已做两层修复：
 
-1. **efinance 调用方式优化**：优先按股票池定向拉取实时行情，避免全市场大请求。  
-2. **多数据源故障转移**：按顺序自动切换 `efinance -> akshare`，前者失败自动尝试后者。
+1. **新增 Eastmoney 直连数据源**：使用 `requests.Session(trust_env=False)`，默认禁用系统代理，规避 `ProxyError`。  
+2. **efinance 调用方式优化**：优先按股票池定向拉取实时行情，避免全市场大请求。  
+3. **多数据源故障转移**：按顺序自动切换 `eastmoney_direct -> efinance -> akshare`。
 
 ## 关键变化
 
-- 默认数据源链：`DATA_PROVIDERS = ["efinance", "akshare"]`
+- 默认数据源链：`DATA_PROVIDERS = ["eastmoney_direct", "efinance", "akshare"]`
 - 可配置数据源优先级（按顺序故障转移）
 - 保留重试 + 缓存兜底：网络抖动时尽量不中断交易循环
 - 支持模型：`linear / xgboost / lstm / transformer`
@@ -24,6 +25,7 @@ python quant_trading_system.py
 ## 常见配置
 
 - `DATA_PROVIDERS`：数据源优先级列表，例如：
+  - `['eastmoney_direct', 'efinance', 'akshare']`
   - `['efinance', 'akshare']`
   - `['akshare']`
 - `MODEL_NAME`：模型类型
@@ -39,3 +41,9 @@ python quant_trading_system.py
 ## 说明
 
 - 代码已支持“可接实盘”架构（HTTP broker gateway），但上线前必须先做长周期回测和小资金灰度验证。
+
+
+## 关于你日志里的 ProxyError
+
+你这次日志里已经出现 `Unable to connect to proxy`，这说明运行环境里有代理链路问题。
+新版本的 `eastmoney_direct` 会默认忽略系统代理环境变量（`trust_env=False`），可绕开这类代理故障。
