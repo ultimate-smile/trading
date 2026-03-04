@@ -32,6 +32,8 @@ MAX_POSITION_RATIO = 0.4
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 BUY_SIGNAL_THRESHOLD = 0.002
+DATA_FETCH_RETRIES = 3  # 行情/历史数据获取重试次数
+DATA_FETCH_RETRY_DELAY = 1.5  # 失败重试基础等待秒数（指数退避）
 
 # 模型配置
 MODEL_NAME = "xgboost"  # 可选: linear / xgboost / lstm / transformer
@@ -128,10 +130,35 @@ class QuantTradingSystem:
         self.enable_live_trading = enable_live_trading
         self.broker = broker
 
+        # 数据兜底缓存（网络抖动时尽量不中断主循环）
+        self.last_spot_prices: Dict[str, float] = {}
+        self.last_history: Dict[str, pd.DataFrame] = {}
+
+    @staticmethod
+    def _with_retry(func, *args, **kwargs):
+        """对外部数据接口调用做重试（指数退避）。"""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, DATA_FETCH_RETRIES + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                last_error = exc
+                sleep_s = DATA_FETCH_RETRY_DELAY * (2 ** (attempt - 1))
+                logging.warning(
+                    "Data fetch failed (attempt=%s/%s): %s; retry in %.1fs",
+                    attempt,
+                    DATA_FETCH_RETRIES,
+                    exc,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+
+        raise RuntimeError(f"Data fetch failed after retries: {last_error}")
+
     @staticmethod
     def get_history(symbol: str, lookback_days: int = MODEL_LOOKBACK_DAYS + 120) -> Optional[pd.DataFrame]:
         """获取并标准化历史K线数据。"""
-        history = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+        history = QuantTradingSystem._with_retry(ak.stock_zh_a_hist, symbol=symbol, period="daily", adjust="qfq")
         if history.empty or len(history) < 60:
             return None
 
@@ -297,9 +324,34 @@ class QuantTradingSystem:
 
     @staticmethod
     def fetch_spot_prices(symbols: list[str]) -> Dict[str, float]:
-        spot = ak.stock_zh_a_spot_em()
+        spot = QuantTradingSystem._with_retry(ak.stock_zh_a_spot_em)
         rows = spot[spot["代码"].isin(symbols)][["代码", "最新价"]]
         return {str(row["代码"]): float(row["最新价"]) for _, row in rows.iterrows()}
+
+    def get_history_safe(self, symbol: str) -> Optional[pd.DataFrame]:
+        """带缓存兜底的历史数据获取。"""
+        try:
+            hist = self.get_history(symbol)
+            if hist is not None and not hist.empty:
+                self.last_history[symbol] = hist
+            return hist
+        except Exception as exc:
+            logging.error("History fetch error for %s: %s", symbol, exc)
+            return self.last_history.get(symbol)
+
+    def fetch_spot_prices_safe(self, symbols: list[str]) -> Dict[str, float]:
+        """带缓存兜底的实时行情获取。"""
+        try:
+            prices = self.fetch_spot_prices(symbols)
+            if prices:
+                self.last_spot_prices.update(prices)
+            return prices
+        except Exception as exc:
+            logging.error("Spot fetch error: %s", exc)
+            fallback = {s: p for s, p in self.last_spot_prices.items() if s in symbols}
+            if fallback:
+                logging.warning("Using cached spot prices for this cycle: %s", list(fallback.keys()))
+            return fallback
 
     def market_value(self, spot_prices: Dict[str, float]) -> float:
         return sum(pos.quantity * spot_prices.get(s, pos.entry_price) for s, pos in self.positions.items())
@@ -347,7 +399,14 @@ class QuantTradingSystem:
 
     def backtest_symbol(self, symbol: str, start_date: str = "2019-01-01", end_date: str = "2024-12-31") -> Optional[BacktestResult]:
         """单标的滚动回测（日线）。"""
-        history = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust="qfq")
+        history = self._with_retry(
+            ak.stock_zh_a_hist,
+            symbol=symbol,
+            period="daily",
+            start_date=start_date.replace("-", ""),
+            end_date=end_date.replace("-", ""),
+            adjust="qfq",
+        )
         if history.empty or len(history) < MIN_TRAIN_SAMPLES + 30:
             return None
         hist = history.rename(columns={"日期": "date", "收盘": "close", "最高": "high", "最低": "low", "开盘": "open"}).copy()
@@ -413,7 +472,7 @@ class QuantTradingSystem:
         logging.info("System started. symbols=%s model=%s live=%s", self.symbols, self.model_name, self.enable_live_trading)
         while True:
             try:
-                spot_prices = self.fetch_spot_prices(self.symbols)
+                spot_prices = self.fetch_spot_prices_safe(self.symbols)
                 if not spot_prices:
                     logging.warning("No spot prices in this cycle")
                     time.sleep(self.poll_interval)
@@ -424,7 +483,7 @@ class QuantTradingSystem:
                     price = spot_prices.get(symbol)
                     if price is None:
                         continue
-                    hist = self.get_history(symbol)
+                    hist = self.get_history_safe(symbol)
                     if hist is None:
                         continue
                     feat = self.build_features(hist)
