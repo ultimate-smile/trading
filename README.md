@@ -1,11 +1,15 @@
 # AI量化交易系统（多模型 + 回测 + 可选实盘网关）
 
-已根据你的反馈把默认数据源从 **AkShare 切换为 efinance**，用于降低 `RemoteDisconnected` 这类上游中断影响。
+你反馈的报错本质是：数据源接口返回了非预期内容（如空响应/反爬页面），导致 JSON 解析失败。  
+本次已做两层修复：
+
+1. **efinance 调用方式优化**：优先按股票池定向拉取实时行情，避免全市场大请求。  
+2. **多数据源故障转移**：按顺序自动切换 `efinance -> akshare`，前者失败自动尝试后者。
 
 ## 关键变化
 
-- 默认数据源：`DATA_PROVIDER="efinance"`
-- 数据源可切换：`efinance / akshare`
+- 默认数据源链：`DATA_PROVIDERS = ["efinance", "akshare"]`
+- 可配置数据源优先级（按顺序故障转移）
 - 保留重试 + 缓存兜底：网络抖动时尽量不中断交易循环
 - 支持模型：`linear / xgboost / lstm / transformer`
 - 支持回测指标：`Sharpe / 最大回撤 / 胜率 / 年化 / 总收益`
@@ -19,22 +23,18 @@ python quant_trading_system.py
 
 ## 常见配置
 
-- `DATA_PROVIDER`：数据源，默认 `efinance`
+- `DATA_PROVIDERS`：数据源优先级列表，例如：
+  - `['efinance', 'akshare']`
+  - `['akshare']`
 - `MODEL_NAME`：模型类型
 - `ENABLE_LIVE_TRADING`：是否开启实盘
 - `INITIAL_CAPITAL`：初始资金
 - `MAX_POSITION_RATIO`：单标的仓位上限
 
-## 你遇到的错误为何能缓解
+## 为什么你之前还会失败
 
-你日志里的错误来自数据源请求被远端中断：
-`requests.exceptions.ConnectionError: RemoteDisconnected(...)`
-
-本版本处理：
-1. 改用 `efinance` 作为默认行情/历史来源；
-2. 对数据请求统一做重试（指数退避）；
-3. 若实时行情失败，回退到最近一次缓存价格；
-4. 若历史失败，回退到该标的最近一次缓存历史。
+你日志中的 `Expecting value: line 1 column 1 (char 0)` 通常是接口返回了空文本/非JSON内容。单一数据源即使重试也可能连续失败。  
+现在系统会自动切换到下一个数据源，显著降低整轮 `No spot prices` 的概率。
 
 ## 说明
 

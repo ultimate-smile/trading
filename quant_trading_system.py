@@ -29,7 +29,7 @@ DATA_FETCH_RETRIES = 3
 DATA_FETCH_RETRY_DELAY = 1.5
 
 # 数据源配置：默认改为 efinance（按你的反馈替换 AkShare）
-DATA_PROVIDER = "efinance"  # 可选: efinance / akshare
+DATA_PROVIDERS = ["efinance", "akshare"]  # 按顺序故障转移
 
 # 模型配置
 MODEL_NAME = "xgboost"  # linear / xgboost / lstm / transformer
@@ -106,7 +106,13 @@ class EFinanceDataProvider:
     def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
         import efinance as ef
 
-        quote = ef.stock.get_realtime_quotes()
+        # 优先按股票池定向拉取，减少全市场请求导致的JSON解析失败概率
+        try:
+            quote = ef.stock.get_realtime_quotes(stock_codes=symbols)
+        except TypeError:
+            quote = ef.stock.get_realtime_quotes(symbols)
+        except Exception:
+            quote = ef.stock.get_realtime_quotes()
         code_col = self._pick_col(quote, ["股票代码", "代码"])
         price_col = self._pick_col(quote, ["最新价", "最新价格"])
         rows = quote[quote[code_col].astype(str).isin(symbols)]
@@ -177,6 +183,18 @@ def build_data_provider(name: str) -> MarketDataProvider:
     raise ValueError(f"不支持的数据源: {name}")
 
 
+def _normalize_provider_names(names: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for n in names:
+        k = n.strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out or ["efinance", "akshare"]
+
+
 class QuantTradingSystem:
     FEATURE_COLS = ["ret_1d", "mom_5d", "mom_10d", "vol_10d", "rsi_14"]
 
@@ -188,7 +206,7 @@ class QuantTradingSystem:
         model_name: str = MODEL_NAME,
         enable_live_trading: bool = ENABLE_LIVE_TRADING,
         broker: Optional[BrokerGateway] = None,
-        data_provider_name: str = DATA_PROVIDER,
+        data_provider_names: Optional[list[str]] = None,
     ) -> None:
         self.symbols = symbols
         self.poll_interval = poll_interval
@@ -200,8 +218,7 @@ class QuantTradingSystem:
         self.model_name = model_name.lower()
         self.enable_live_trading = enable_live_trading
         self.broker = broker
-        self.data_provider_name = data_provider_name
-        self.data_provider = build_data_provider(data_provider_name)
+        self.data_provider_names = data_provider_names or list(DATA_PROVIDERS)
 
         self.last_spot_prices: Dict[str, float] = {}
         self.last_history: Dict[str, pd.DataFrame] = {}
@@ -219,11 +236,24 @@ class QuantTradingSystem:
                 time.sleep(sleep_s)
         raise RuntimeError(f"Data fetch failed after retries: {last_error}")
 
+    def _iter_providers(self):
+        for name in _normalize_provider_names(self.data_provider_names):
+            yield name, build_data_provider(name)
+
     def get_history(self, symbol: str, lookback_days: int = MODEL_LOOKBACK_DAYS + 120) -> Optional[pd.DataFrame]:
-        history = self._with_retry(self.data_provider.get_history, symbol, lookback_days)
-        if history.empty or len(history) < 60:
-            return None
-        return history
+        last_error = None
+        for provider_name, provider in self._iter_providers():
+            try:
+                history = self._with_retry(provider.get_history, symbol, lookback_days)
+                if history.empty or len(history) < 60:
+                    continue
+                return history
+            except Exception as exc:
+                last_error = exc
+                logging.warning("history provider failed: %s symbol=%s err=%s", provider_name, symbol, exc)
+        if last_error:
+            raise RuntimeError(f"all providers failed for history: {last_error}")
+        return None
 
     @staticmethod
     def build_features(hist: pd.DataFrame) -> pd.DataFrame:
@@ -346,7 +376,18 @@ class QuantTradingSystem:
         return self._predict_linear(train_df, latest, self.FEATURE_COLS)
 
     def fetch_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
-        return self._with_retry(self.data_provider.get_spot_prices, symbols)
+        last_error = None
+        for provider_name, provider in self._iter_providers():
+            try:
+                prices = self._with_retry(provider.get_spot_prices, symbols)
+                if prices:
+                    return prices
+            except Exception as exc:
+                last_error = exc
+                logging.warning("spot provider failed: %s err=%s", provider_name, exc)
+        if last_error:
+            raise RuntimeError(f"all providers failed for spot: {last_error}")
+        return {}
 
     def get_history_safe(self, symbol: str) -> Optional[pd.DataFrame]:
         try:
@@ -412,7 +453,18 @@ class QuantTradingSystem:
 
     def backtest_symbol(self, symbol: str, start_date: str = "2019-01-01", end_date: str = "2024-12-31") -> Optional[BacktestResult]:
         try:
-            hist = self._with_retry(self.data_provider.get_history, symbol, MODEL_LOOKBACK_DAYS + 400, start_date, end_date)
+            hist = None
+            last_error = None
+            for provider_name, provider in self._iter_providers():
+                try:
+                    hist = self._with_retry(provider.get_history, symbol, MODEL_LOOKBACK_DAYS + 400, start_date, end_date)
+                    if hist is not None and not hist.empty:
+                        break
+                except Exception as exc:
+                    last_error = exc
+                    logging.warning("backtest provider failed: %s symbol=%s err=%s", provider_name, symbol, exc)
+            if hist is None or hist.empty:
+                raise RuntimeError(last_error or "no backtest data")
         except Exception as exc:
             logging.error("Backtest data fetch failed for %s: %s", symbol, exc)
             return None
@@ -460,7 +512,7 @@ class QuantTradingSystem:
         return BacktestResult(symbol, self.model_name, float(total_return), float(annualized), float(sharpe), float(max_dd), float(win_rate), int(trades))
 
     def run(self) -> None:
-        logging.info("System started. symbols=%s model=%s data_provider=%s live=%s", self.symbols, self.model_name, self.data_provider_name, self.enable_live_trading)
+        logging.info("System started. symbols=%s model=%s data_providers=%s live=%s", self.symbols, self.model_name, _normalize_provider_names(self.data_provider_names), self.enable_live_trading)
         while True:
             try:
                 spot_prices = self.fetch_spot_prices_safe(self.symbols)
@@ -517,6 +569,6 @@ if __name__ == "__main__":
         model_name=MODEL_NAME,
         enable_live_trading=ENABLE_LIVE_TRADING,
         broker=broker,
-        data_provider_name=DATA_PROVIDER,
+        data_provider_names=DATA_PROVIDERS,
     )
     system.run()
