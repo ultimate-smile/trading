@@ -1,10 +1,4 @@
-"""AI量化交易系统（支持多模型、回测与可选实盘网关）。
-
-版本目标：
-1) 模型层支持 Linear / XGBoost / LSTM / Transformer（后3者为可选依赖）；
-2) 交易层支持纸上交易与“可接入”实盘下单网关；
-3) 评估层内置日线回测，并输出 Sharpe / 最大回撤 / 胜率。
-"""
+"""AI量化交易系统（多模型 + 回测 + 可选实盘网关 + 可切换数据源）。"""
 
 from __future__ import annotations
 
@@ -14,7 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional, Protocol
 
-import akshare as ak
 import numpy as np
 import pandas as pd
 
@@ -32,25 +25,26 @@ MAX_POSITION_RATIO = 0.4
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 BUY_SIGNAL_THRESHOLD = 0.002
-DATA_FETCH_RETRIES = 3  # 行情/历史数据获取重试次数
-DATA_FETCH_RETRY_DELAY = 1.5  # 失败重试基础等待秒数（指数退避）
+DATA_FETCH_RETRIES = 3
+DATA_FETCH_RETRY_DELAY = 1.5
+
+# 数据源配置：默认改为 efinance（按你的反馈替换 AkShare）
+DATA_PROVIDER = "efinance"  # 可选: efinance / akshare
 
 # 模型配置
-MODEL_NAME = "xgboost"  # 可选: linear / xgboost / lstm / transformer
-SEQUENCE_LENGTH = 20  # LSTM/Transformer序列长度
+MODEL_NAME = "xgboost"  # linear / xgboost / lstm / transformer
+SEQUENCE_LENGTH = 20
 NN_EPOCHS = 20
 NN_LR = 1e-3
 
 # 实盘相关配置
-ENABLE_LIVE_TRADING = False  # 生产环境务必配合风控与小额验证后再开启
-BROKER_BASE_URL = ""  # 例如: https://your-broker-gateway/api
+ENABLE_LIVE_TRADING = False
+BROKER_BASE_URL = ""
 BROKER_API_KEY = ""
 
 
 @dataclass
 class Position:
-    """单个持仓对象。"""
-
     symbol: str
     quantity: int
     entry_price: float
@@ -59,8 +53,6 @@ class Position:
 
 @dataclass
 class BacktestResult:
-    """回测结果核心指标。"""
-
     symbol: str
     model_name: str
     total_return: float
@@ -72,21 +64,11 @@ class BacktestResult:
 
 
 class BrokerGateway(Protocol):
-    """券商网关协议。
-
-    任意实盘网关只要实现 place_order 即可被系统接入。
-    """
-
     def place_order(self, symbol: str, side: str, quantity: int, price: float) -> dict:
         ...
 
 
 class HttpBrokerGateway:
-    """HTTP实盘网关示例。
-
-    通过你自己的中间层服务转发到真实券商。
-    """
-
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -103,9 +85,99 @@ class HttpBrokerGateway:
         return resp.json()
 
 
-class QuantTradingSystem:
-    """量化交易系统主类。"""
+class MarketDataProvider(Protocol):
+    def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        ...
 
+    def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        ...
+
+
+class EFinanceDataProvider:
+    """efinance 数据源实现。"""
+
+    @staticmethod
+    def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str:
+        for c in candidates:
+            if c in df.columns:
+                return c
+        raise KeyError(f"缺少列，候选={candidates}, 实际={list(df.columns)}")
+
+    def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        import efinance as ef
+
+        quote = ef.stock.get_realtime_quotes()
+        code_col = self._pick_col(quote, ["股票代码", "代码"])
+        price_col = self._pick_col(quote, ["最新价", "最新价格"])
+        rows = quote[quote[code_col].astype(str).isin(symbols)]
+        result: Dict[str, float] = {}
+        for _, row in rows.iterrows():
+            try:
+                result[str(row[code_col])] = float(row[price_col])
+            except Exception:
+                continue
+        return result
+
+    def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        import efinance as ef
+
+        beg = (start_date or "20180101").replace("-", "")
+        end = (end_date or datetime.now().strftime("%Y%m%d")).replace("-", "")
+        hist = ef.stock.get_quote_history(symbol, beg=beg, end=end, klt=101, fqt=1)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+
+        date_col = self._pick_col(hist, ["日期"])
+        open_col = self._pick_col(hist, ["开盘"])
+        high_col = self._pick_col(hist, ["最高"])
+        low_col = self._pick_col(hist, ["最低"])
+        close_col = self._pick_col(hist, ["收盘"])
+        out = hist[[date_col, open_col, high_col, low_col, close_col]].copy()
+        out.columns = ["date", "open", "high", "low", "close"]
+        out["date"] = pd.to_datetime(out["date"])
+        out = out.sort_values("date").tail(lookback_days).reset_index(drop=True)
+        return out
+
+
+class AkshareDataProvider:
+    """AkShare 数据源实现（可选备用）。"""
+
+    def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        import akshare as ak
+
+        spot = ak.stock_zh_a_spot_em()
+        rows = spot[spot["代码"].isin(symbols)][["代码", "最新价"]]
+        return {str(row["代码"]): float(row["最新价"]) for _, row in rows.iterrows()}
+
+    def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        import akshare as ak
+
+        if start_date or end_date:
+            hist = ak.stock_zh_a_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=(start_date or "20180101").replace("-", ""),
+                end_date=(end_date or datetime.now().strftime("%Y%m%d")).replace("-", ""),
+                adjust="qfq",
+            )
+        else:
+            hist = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+        if hist.empty:
+            return pd.DataFrame()
+        out = hist.rename(columns={"日期": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close"})
+        out["date"] = pd.to_datetime(out["date"])
+        return out[["date", "open", "high", "low", "close"]].sort_values("date").tail(lookback_days).reset_index(drop=True)
+
+
+def build_data_provider(name: str) -> MarketDataProvider:
+    if name.lower() == "efinance":
+        return EFinanceDataProvider()
+    if name.lower() == "akshare":
+        return AkshareDataProvider()
+    raise ValueError(f"不支持的数据源: {name}")
+
+
+class QuantTradingSystem:
     FEATURE_COLS = ["ret_1d", "mom_5d", "mom_10d", "vol_10d", "rsi_14"]
 
     def __init__(
@@ -116,8 +188,8 @@ class QuantTradingSystem:
         model_name: str = MODEL_NAME,
         enable_live_trading: bool = ENABLE_LIVE_TRADING,
         broker: Optional[BrokerGateway] = None,
+        data_provider_name: str = DATA_PROVIDER,
     ) -> None:
-        # 主要变量（账户状态）
         self.symbols = symbols
         self.poll_interval = poll_interval
         self.initial_capital = float(initial_capital)
@@ -125,18 +197,17 @@ class QuantTradingSystem:
         self.positions: Dict[str, Position] = {}
         self.realized_pnl = 0.0
 
-        # 主要变量（模型/执行）
         self.model_name = model_name.lower()
         self.enable_live_trading = enable_live_trading
         self.broker = broker
+        self.data_provider_name = data_provider_name
+        self.data_provider = build_data_provider(data_provider_name)
 
-        # 数据兜底缓存（网络抖动时尽量不中断主循环）
         self.last_spot_prices: Dict[str, float] = {}
         self.last_history: Dict[str, pd.DataFrame] = {}
 
     @staticmethod
     def _with_retry(func, *args, **kwargs):
-        """对外部数据接口调用做重试（指数退避）。"""
         last_error: Optional[Exception] = None
         for attempt in range(1, DATA_FETCH_RETRIES + 1):
             try:
@@ -144,33 +215,18 @@ class QuantTradingSystem:
             except Exception as exc:
                 last_error = exc
                 sleep_s = DATA_FETCH_RETRY_DELAY * (2 ** (attempt - 1))
-                logging.warning(
-                    "Data fetch failed (attempt=%s/%s): %s; retry in %.1fs",
-                    attempt,
-                    DATA_FETCH_RETRIES,
-                    exc,
-                    sleep_s,
-                )
+                logging.warning("Data fetch failed (%s/%s): %s; retry in %.1fs", attempt, DATA_FETCH_RETRIES, exc, sleep_s)
                 time.sleep(sleep_s)
-
         raise RuntimeError(f"Data fetch failed after retries: {last_error}")
 
-    @staticmethod
-    def get_history(symbol: str, lookback_days: int = MODEL_LOOKBACK_DAYS + 120) -> Optional[pd.DataFrame]:
-        """获取并标准化历史K线数据。"""
-        history = QuantTradingSystem._with_retry(ak.stock_zh_a_hist, symbol=symbol, period="daily", adjust="qfq")
+    def get_history(self, symbol: str, lookback_days: int = MODEL_LOOKBACK_DAYS + 120) -> Optional[pd.DataFrame]:
+        history = self._with_retry(self.data_provider.get_history, symbol, lookback_days)
         if history.empty or len(history) < 60:
             return None
-
-        hist = history.copy()
-        hist = hist.rename(columns={"日期": "date", "收盘": "close", "最高": "high", "最低": "low", "开盘": "open"})
-        hist["date"] = pd.to_datetime(hist["date"])
-        hist = hist.sort_values("date").tail(lookback_days).reset_index(drop=True)
-        return hist
+        return history
 
     @staticmethod
     def build_features(hist: pd.DataFrame) -> pd.DataFrame:
-        """构建特征与标签。"""
         df = hist.copy()
         df["ret_1d"] = df["close"].pct_change(1)
         df["mom_5d"] = df["close"].pct_change(5)
@@ -182,22 +238,19 @@ class QuantTradingSystem:
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rs = gain / loss.replace(0, np.nan)
         df["rsi_14"] = 100 - (100 / (1 + rs))
-
         df["target_next_ret"] = df["close"].shift(-1) / df["close"] - 1
         return df
 
     @staticmethod
-    def _predict_linear(train_df: pd.DataFrame, latest_row: pd.Series, feature_cols: list[str]) -> Optional[float]:
+    def _predict_linear(train_df: pd.DataFrame, latest_row: pd.Series, feature_cols: list[str]) -> float:
         x_train = train_df[feature_cols].to_numpy(dtype=float)
         y_train = train_df["target_next_ret"].to_numpy(dtype=float)
         means = x_train.mean(axis=0)
         stds = np.where(x_train.std(axis=0) == 0, 1.0, x_train.std(axis=0))
-        x_scaled = (x_train - means) / stds
-        design = np.column_stack([np.ones(len(x_scaled)), x_scaled])
+        design = np.column_stack([np.ones(len(x_train)), (x_train - means) / stds])
         coefs, *_ = np.linalg.lstsq(design, y_train, rcond=None)
         x_latest = latest_row[feature_cols].to_numpy(dtype=float)
-        x_latest_scaled = (x_latest - means) / stds
-        return float(coefs[0] + np.dot(coefs[1:], x_latest_scaled))
+        return float(coefs[0] + np.dot(coefs[1:], (x_latest - means) / stds))
 
     @staticmethod
     def _predict_xgboost(train_df: pd.DataFrame, latest_row: pd.Series, feature_cols: list[str]) -> Optional[float]:
@@ -205,26 +258,12 @@ class QuantTradingSystem:
             from xgboost import XGBRegressor
         except ImportError:
             return None
-        model = XGBRegressor(
-            n_estimators=120,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="reg:squarederror",
-            random_state=42,
-        )
+        model = XGBRegressor(n_estimators=120, max_depth=3, learning_rate=0.05, subsample=0.9, colsample_bytree=0.9, objective="reg:squarederror", random_state=42)
         model.fit(train_df[feature_cols], train_df["target_next_ret"])
-        pred = model.predict(latest_row[feature_cols].to_frame().T)[0]
-        return float(pred)
+        return float(model.predict(latest_row[feature_cols].to_frame().T)[0])
 
     @staticmethod
-    def _predict_lstm_or_transformer(
-        train_df: pd.DataFrame,
-        latest_window: np.ndarray,
-        feature_cols: list[str],
-        model_name: str,
-    ) -> Optional[float]:
+    def _predict_lstm_or_transformer(train_df: pd.DataFrame, latest_window: np.ndarray, feature_cols: list[str], model_name: str) -> Optional[float]:
         try:
             import torch
             import torch.nn as nn
@@ -233,14 +272,11 @@ class QuantTradingSystem:
 
         x = train_df[feature_cols].to_numpy(dtype=np.float32)
         y = train_df["target_next_ret"].to_numpy(dtype=np.float32)
-
         if len(x) <= SEQUENCE_LENGTH + 1:
             return None
 
-        # 标准化
         means = x.mean(axis=0)
-        stds = x.std(axis=0)
-        stds = np.where(stds == 0, 1.0, stds)
+        stds = np.where(x.std(axis=0) == 0, 1.0, x.std(axis=0))
         x = (x - means) / stds
         latest_window = (latest_window - means) / stds
 
@@ -277,59 +313,42 @@ class QuantTradingSystem:
         model = LSTMRegressor(len(feature_cols)) if model_name == "lstm" else TransformerRegressor(len(feature_cols))
         optimizer = torch.optim.Adam(model.parameters(), lr=NN_LR)
         loss_fn = nn.MSELoss()
-
         model.train()
         for _ in range(NN_EPOCHS):
             optimizer.zero_grad()
-            pred = model(X)
-            loss = loss_fn(pred, Y)
+            loss = loss_fn(model(X), Y)
             loss.backward()
             optimizer.step()
 
         model.eval()
-        latest_tensor = torch.tensor(latest_window[np.newaxis, :, :], dtype=torch.float32)
         with torch.no_grad():
-            pred = model(latest_tensor).item()
-        return float(pred)
+            return float(model(torch.tensor(latest_window[np.newaxis, :, :], dtype=torch.float32)).item())
 
     def predict_next_return(self, feature_df: pd.DataFrame) -> Optional[float]:
-        """根据 model_name 预测下一日收益率。"""
-        cols = self.FEATURE_COLS
-        clean = feature_df.dropna(subset=cols + ["target_next_ret"]).copy()
+        clean = feature_df.dropna(subset=self.FEATURE_COLS + ["target_next_ret"]).copy()
         if len(clean) < MIN_TRAIN_SAMPLES:
             return None
-
         train_df = clean.tail(MODEL_LOOKBACK_DAYS)
         latest = feature_df.iloc[-1]
-        if latest[cols].isna().any():
+        if latest[self.FEATURE_COLS].isna().any():
             return None
 
         if self.model_name == "linear":
-            return self._predict_linear(train_df, latest, cols)
+            return self._predict_linear(train_df, latest, self.FEATURE_COLS)
         if self.model_name == "xgboost":
-            return self._predict_xgboost(train_df, latest, cols) or self._predict_linear(train_df, latest, cols)
+            return self._predict_xgboost(train_df, latest, self.FEATURE_COLS) or self._predict_linear(train_df, latest, self.FEATURE_COLS)
         if self.model_name in {"lstm", "transformer"}:
-            latest_window_df = feature_df.dropna(subset=cols).tail(SEQUENCE_LENGTH)
+            latest_window_df = feature_df.dropna(subset=self.FEATURE_COLS).tail(SEQUENCE_LENGTH)
             if len(latest_window_df) < SEQUENCE_LENGTH:
                 return None
-            pred = self._predict_lstm_or_transformer(
-                train_df,
-                latest_window_df[cols].to_numpy(dtype=np.float32),
-                cols,
-                self.model_name,
-            )
-            return pred or self._predict_linear(train_df, latest, cols)
+            pred = self._predict_lstm_or_transformer(train_df, latest_window_df[self.FEATURE_COLS].to_numpy(dtype=np.float32), self.FEATURE_COLS, self.model_name)
+            return pred or self._predict_linear(train_df, latest, self.FEATURE_COLS)
+        return self._predict_linear(train_df, latest, self.FEATURE_COLS)
 
-        return self._predict_linear(train_df, latest, cols)
-
-    @staticmethod
-    def fetch_spot_prices(symbols: list[str]) -> Dict[str, float]:
-        spot = QuantTradingSystem._with_retry(ak.stock_zh_a_spot_em)
-        rows = spot[spot["代码"].isin(symbols)][["代码", "最新价"]]
-        return {str(row["代码"]): float(row["最新价"]) for _, row in rows.iterrows()}
+    def fetch_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        return self._with_retry(self.data_provider.get_spot_prices, symbols)
 
     def get_history_safe(self, symbol: str) -> Optional[pd.DataFrame]:
-        """带缓存兜底的历史数据获取。"""
         try:
             hist = self.get_history(symbol)
             if hist is not None and not hist.empty:
@@ -340,7 +359,6 @@ class QuantTradingSystem:
             return self.last_history.get(symbol)
 
     def fetch_spot_prices_safe(self, symbols: list[str]) -> Dict[str, float]:
-        """带缓存兜底的实时行情获取。"""
         try:
             prices = self.fetch_spot_prices(symbols)
             if prices:
@@ -360,15 +378,12 @@ class QuantTradingSystem:
         return self.cash + self.market_value(spot_prices)
 
     def compute_order_quantity(self, price: float, spot_prices: Dict[str, float]) -> int:
-        equity = self.total_equity(spot_prices)
-        target_value = equity * MAX_POSITION_RATIO
-        affordable = min(target_value, self.cash)
-        lots = int(affordable // (price * LOT_SIZE))
-        return max(0, lots * LOT_SIZE)
+        affordable = min(self.total_equity(spot_prices) * MAX_POSITION_RATIO, self.cash)
+        return max(0, int(affordable // (price * LOT_SIZE)) * LOT_SIZE)
 
     def should_force_sell(self, symbol: str, price: float) -> bool:
-        position = self.positions[symbol]
-        pnl_pct = (price - position.entry_price) / position.entry_price
+        pos = self.positions[symbol]
+        pnl_pct = (price - pos.entry_price) / pos.entry_price
         return pnl_pct <= -STOP_LOSS_PCT or pnl_pct >= TAKE_PROFIT_PCT
 
     def _send_live_order(self, symbol: str, side: str, quantity: int, price: float) -> None:
@@ -376,8 +391,7 @@ class QuantTradingSystem:
             return
         if self.broker is None:
             raise RuntimeError("ENABLE_LIVE_TRADING=True 但未提供 broker 网关")
-        result = self.broker.place_order(symbol=symbol, side=side, quantity=quantity, price=price)
-        logging.info("LIVE_ORDER | %s", result)
+        logging.info("LIVE_ORDER | %s", self.broker.place_order(symbol=symbol, side=side, quantity=quantity, price=price))
 
     def place_buy_order(self, symbol: str, price: float, quantity: int) -> None:
         cost = price * quantity
@@ -389,55 +403,44 @@ class QuantTradingSystem:
         logging.info("BUY  | symbol=%s qty=%s price=%.2f cash=%.2f", symbol, quantity, price, self.cash)
 
     def place_sell_order(self, symbol: str, price: float, reason: str) -> None:
-        position = self.positions.pop(symbol)
-        self._send_live_order(symbol, "SELL", position.quantity, price)
-        value = price * position.quantity
-        pnl = (price - position.entry_price) * position.quantity
+        pos = self.positions.pop(symbol)
+        self._send_live_order(symbol, "SELL", pos.quantity, price)
+        pnl = (price - pos.entry_price) * pos.quantity
         self.realized_pnl += pnl
-        self.cash += value
-        logging.info("SELL | symbol=%s qty=%s price=%.2f pnl=%.2f reason=%s cash=%.2f", symbol, position.quantity, price, pnl, reason, self.cash)
+        self.cash += price * pos.quantity
+        logging.info("SELL | symbol=%s qty=%s price=%.2f pnl=%.2f reason=%s cash=%.2f", symbol, pos.quantity, price, pnl, reason, self.cash)
 
     def backtest_symbol(self, symbol: str, start_date: str = "2019-01-01", end_date: str = "2024-12-31") -> Optional[BacktestResult]:
-        """单标的滚动回测（日线）。"""
-        history = self._with_retry(
-            ak.stock_zh_a_hist,
-            symbol=symbol,
-            period="daily",
-            start_date=start_date.replace("-", ""),
-            end_date=end_date.replace("-", ""),
-            adjust="qfq",
-        )
-        if history.empty or len(history) < MIN_TRAIN_SAMPLES + 30:
+        try:
+            hist = self._with_retry(self.data_provider.get_history, symbol, MODEL_LOOKBACK_DAYS + 400, start_date, end_date)
+        except Exception as exc:
+            logging.error("Backtest data fetch failed for %s: %s", symbol, exc)
             return None
-        hist = history.rename(columns={"日期": "date", "收盘": "close", "最高": "high", "最低": "low", "开盘": "open"}).copy()
-        hist["date"] = pd.to_datetime(hist["date"])
+        if hist.empty or len(hist) < MIN_TRAIN_SAMPLES + 30:
+            return None
+
         feat = self.build_features(hist)
-
-        returns = []
-        equity_curve = [1.0]
-        win, trade_count = 0, 0
-
         clean = feat.dropna(subset=self.FEATURE_COLS + ["target_next_ret"]).reset_index(drop=True)
+        returns, equity_curve = [], [1.0]
+        win, trades = 0, 0
+
         for i in range(MIN_TRAIN_SAMPLES, len(clean) - 1):
-            train_slice = clean.iloc[:i].tail(MODEL_LOOKBACK_DAYS).copy()
+            train_slice = clean.iloc[:i].tail(MODEL_LOOKBACK_DAYS)
             latest_row = clean.iloc[i]
             next_ret = float(clean.iloc[i]["target_next_ret"])
-
-            # 为复用预测方法构造临时DataFrame
             pred_df = pd.concat([train_slice, latest_row.to_frame().T], ignore_index=True)
             pred = self.predict_next_return(pred_df)
+
             if pred is None:
                 strategy_ret = 0.0
             elif pred > BUY_SIGNAL_THRESHOLD:
                 strategy_ret = next_ret
-                trade_count += 1
-                if strategy_ret > 0:
-                    win += 1
+                trades += 1
+                win += int(strategy_ret > 0)
             elif pred < -BUY_SIGNAL_THRESHOLD:
                 strategy_ret = -next_ret
-                trade_count += 1
-                if strategy_ret > 0:
-                    win += 1
+                trades += 1
+                win += int(strategy_ret > 0)
             else:
                 strategy_ret = 0.0
 
@@ -449,27 +452,15 @@ class QuantTradingSystem:
         annualized = (1 + total_return) ** (252 / max(1, len(ret_arr))) - 1
         vol = ret_arr.std() * np.sqrt(252)
         sharpe = 0.0 if vol == 0 else (ret_arr.mean() * 252) / vol
-
-        curve = np.array(equity_curve, dtype=float)
+        curve = np.array(equity_curve)
         peak = np.maximum.accumulate(curve)
-        drawdown = (curve - peak) / peak
-        max_dd = abs(drawdown.min())
-        win_rate = 0.0 if trade_count == 0 else win / trade_count
+        max_dd = abs(((curve - peak) / peak).min())
+        win_rate = 0.0 if trades == 0 else win / trades
 
-        return BacktestResult(
-            symbol=symbol,
-            model_name=self.model_name,
-            total_return=float(total_return),
-            annualized_return=float(annualized),
-            sharpe=float(sharpe),
-            max_drawdown=float(max_dd),
-            win_rate=float(win_rate),
-            trades=int(trade_count),
-        )
+        return BacktestResult(symbol, self.model_name, float(total_return), float(annualized), float(sharpe), float(max_dd), float(win_rate), int(trades))
 
     def run(self) -> None:
-        """主循环：数据 -> 预测 -> 风控卖出 -> 选股买入 -> 账户汇总。"""
-        logging.info("System started. symbols=%s model=%s live=%s", self.symbols, self.model_name, self.enable_live_trading)
+        logging.info("System started. symbols=%s model=%s data_provider=%s live=%s", self.symbols, self.model_name, self.data_provider_name, self.enable_live_trading)
         while True:
             try:
                 spot_prices = self.fetch_spot_prices_safe(self.symbols)
@@ -486,12 +477,10 @@ class QuantTradingSystem:
                     hist = self.get_history_safe(symbol)
                     if hist is None:
                         continue
-                    feat = self.build_features(hist)
-                    pred = self.predict_next_return(feat)
-                    if pred is None:
-                        continue
-                    predictions[symbol] = pred
-                    logging.info("TICK | %s price=%.2f pred=%.4f", symbol, price, pred)
+                    pred = self.predict_next_return(self.build_features(hist))
+                    if pred is not None:
+                        predictions[symbol] = pred
+                        logging.info("TICK | %s price=%.2f pred=%.4f", symbol, price, pred)
 
                 for symbol in list(self.positions.keys()):
                     price = spot_prices.get(symbol)
@@ -502,8 +491,7 @@ class QuantTradingSystem:
                     elif predictions.get(symbol, -1.0) < -BUY_SIGNAL_THRESHOLD:
                         self.place_sell_order(symbol, price, "model_turn_negative")
 
-                ranked = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
-                for symbol, pred in ranked:
+                for symbol, pred in sorted(predictions.items(), key=lambda x: x[1], reverse=True):
                     if pred < BUY_SIGNAL_THRESHOLD or symbol in self.positions:
                         continue
                     qty = self.compute_order_quantity(spot_prices[symbol], spot_prices)
@@ -511,14 +499,7 @@ class QuantTradingSystem:
                         self.place_buy_order(symbol, spot_prices[symbol], qty)
 
                 equity = self.total_equity(spot_prices)
-                logging.info(
-                    "ACCOUNT | cash=%.2f holdings=%.2f equity=%.2f realized=%.2f positions=%s",
-                    self.cash,
-                    self.market_value(spot_prices),
-                    equity,
-                    self.realized_pnl,
-                    list(self.positions.keys()),
-                )
+                logging.info("ACCOUNT | cash=%.2f holdings=%.2f equity=%.2f realized=%.2f positions=%s", self.cash, self.market_value(spot_prices), equity, self.realized_pnl, list(self.positions.keys()))
             except Exception as exc:
                 logging.exception("Cycle error: %s", exc)
 
@@ -528,10 +509,7 @@ class QuantTradingSystem:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    broker = None
-    if ENABLE_LIVE_TRADING:
-        broker = HttpBrokerGateway(base_url=BROKER_BASE_URL, api_key=BROKER_API_KEY)
-
+    broker = HttpBrokerGateway(BROKER_BASE_URL, BROKER_API_KEY) if ENABLE_LIVE_TRADING else None
     system = QuantTradingSystem(
         symbols=SYMBOLS,
         initial_capital=INITIAL_CAPITAL,
@@ -539,12 +517,6 @@ if __name__ == "__main__":
         model_name=MODEL_NAME,
         enable_live_trading=ENABLE_LIVE_TRADING,
         broker=broker,
+        data_provider_name=DATA_PROVIDER,
     )
-
-    # 启动前可先做回测：
-    # for s in SYMBOLS:
-    #     result = system.backtest_symbol(s)
-    #     if result:
-    #         logging.info("BACKTEST | %s", result)
-
     system.run()

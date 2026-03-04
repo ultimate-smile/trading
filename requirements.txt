@@ -1,6 +1,7 @@
-akshare>=1.14.82
 pandas>=2.0.0
 numpy>=1.24.0
+efinance>=0.5.5
+akshare>=1.14.82
 xgboost>=2.0.0
 torch>=2.2.0
 requests>=2.31.0
