@@ -1,15 +1,11 @@
-"""AI-assisted quantitative trading system for A-share symbols.
+"""AI增强量化交易系统（A股示例，纸上交易版）。
 
-Features
---------
-- 100,000 CNY initial capital by default.
-- Online inference of next-day return using a lightweight linear model.
-- Risk controls: max position size, stop-loss, take-profit and cash checks.
-- Paper-trading implementation (in-memory portfolio and trade logs).
+核心能力：
+1) 使用历史行情构造因子并训练轻量线性模型预测下一日收益率；
+2) 在 10W 初始资金约束下进行仓位控制与交易决策；
+3) 内置止损/止盈/模型转弱退出等基础风险管理。
 
-Disclaimer
-----------
-This script is for educational/research usage only and is NOT investment advice.
+注意：本脚本仅用于学习研究，不构成任何投资建议。
 """
 
 from __future__ import annotations
@@ -25,20 +21,32 @@ import numpy as np
 import pandas as pd
 
 
-POLL_INTERVAL_SECONDS = 30
-SYMBOLS = ["000988", "688387"]
-INITIAL_CAPITAL = 100_000
-LOT_SIZE = 100
-MODEL_LOOKBACK_DAYS = 120
-MIN_TRAIN_SAMPLES = 40
-MAX_POSITION_RATIO = 0.4
-STOP_LOSS_PCT = 0.03
-TAKE_PROFIT_PCT = 0.06
-BUY_SIGNAL_THRESHOLD = 0.002
+# =============================
+# 关键参数（可按需求调优）
+# =============================
+POLL_INTERVAL_SECONDS = 30  # 轮询间隔（秒）
+SYMBOLS = ["000988", "688387"]  # 股票池（A股代码）
+INITIAL_CAPITAL = 100_000  # 初始资金（元）
+LOT_SIZE = 100  # A股最小交易单位：1手=100股
+MODEL_LOOKBACK_DAYS = 120  # 模型训练最多使用最近N天样本
+MIN_TRAIN_SAMPLES = 40  # 模型最小训练样本数，低于该值不交易
+MAX_POSITION_RATIO = 0.4  # 单标的最大仓位比例（占总权益）
+STOP_LOSS_PCT = 0.03  # 止损阈值（-3%）
+TAKE_PROFIT_PCT = 0.06  # 止盈阈值（+6%）
+BUY_SIGNAL_THRESHOLD = 0.002  # 买入阈值（预测收益率 > 0.2%）
 
 
 @dataclass
 class Position:
+    """单个持仓对象（主要变量容器）。
+
+    属性说明：
+    - symbol: 股票代码
+    - quantity: 持仓股数
+    - entry_price: 开仓价格
+    - entry_time: 开仓时间
+    """
+
     symbol: str
     quantity: int
     entry_price: float
@@ -46,22 +54,33 @@ class Position:
 
 
 class QuantTradingSystem:
+    """量化交易系统主类。"""
+
     def __init__(
         self,
         symbols: list[str],
         initial_capital: float = INITIAL_CAPITAL,
         poll_interval: int = POLL_INTERVAL_SECONDS,
     ) -> None:
-        self.symbols = symbols
-        self.poll_interval = poll_interval
-        self.initial_capital = float(initial_capital)
-        self.cash = float(initial_capital)
-        self.positions: Dict[str, Position] = {}
-        self.realized_pnl = 0.0
+        # ===== 主要变量（账户维度） =====
+        self.symbols = symbols  # 跟踪股票池
+        self.poll_interval = poll_interval  # 主循环轮询间隔
+        self.initial_capital = float(initial_capital)  # 初始资金
+        self.cash = float(initial_capital)  # 可用现金
+        self.positions: Dict[str, Position] = {}  # 当前持仓：symbol -> Position
+        self.realized_pnl = 0.0  # 已实现盈亏（平仓后累计）
 
     @staticmethod
     def get_history(symbol: str, lookback_days: int = MODEL_LOOKBACK_DAYS + 40) -> Optional[pd.DataFrame]:
-        """Fetch historical daily bars and normalize column names."""
+        """获取并标准化历史K线数据。
+
+        参数：
+        - symbol: 股票代码
+        - lookback_days: 拉取后保留的历史天数
+
+        返回：
+        - 含 date/open/high/low/close 的DataFrame；若数据不足返回None。
+        """
         history = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
         if history.empty or len(history) < 30:
             return None
@@ -74,7 +93,15 @@ class QuantTradingSystem:
 
     @staticmethod
     def build_features(hist: pd.DataFrame) -> pd.DataFrame:
-        """Create ML features and prediction target (next-day return)."""
+        """构建模型输入因子与预测目标。
+
+        关键字段：
+        - ret_1d: 1日收益率
+        - mom_5d/mom_10d: 5/10日动量
+        - vol_10d: 10日波动率（1日收益标准差）
+        - rsi_14: 14日RSI
+        - target_next_ret: 下一交易日收益率（监督学习标签）
+        """
         df = hist.copy()
         df["ret_1d"] = df["close"].pct_change(1)
         df["mom_5d"] = df["close"].pct_change(5)
@@ -93,7 +120,14 @@ class QuantTradingSystem:
 
     @staticmethod
     def predict_next_return(feature_df: pd.DataFrame) -> Optional[float]:
-        """Train a tiny linear model and predict next-day return for latest row."""
+        """训练轻量线性模型，并预测“最新时点”的下一日收益率。
+
+        方法说明：
+        - 先做缺失值过滤与样本量检查；
+        - 对特征标准化；
+        - 使用最小二乘拟合线性回归；
+        - 输出最新一行特征的预测收益率。
+        """
         cols = ["ret_1d", "mom_5d", "mom_10d", "vol_10d", "rsi_14"]
         clean = feature_df.dropna(subset=cols + ["target_next_ret"]).copy()
         if len(clean) < MIN_TRAIN_SAMPLES:
@@ -103,13 +137,13 @@ class QuantTradingSystem:
         x_train = train[cols].to_numpy(dtype=float)
         y_train = train["target_next_ret"].to_numpy(dtype=float)
 
-        # Feature standardization
+        # 特征标准化
         means = x_train.mean(axis=0)
         stds = x_train.std(axis=0)
         stds = np.where(stds == 0, 1.0, stds)
         x_train_scaled = (x_train - means) / stds
 
-        # Linear regression via least squares: y = b0 + b1*x1 + ...
+        # 最小二乘线性回归: y = b0 + b1*x1 + ...
         design = np.column_stack([np.ones(len(x_train_scaled)), x_train_scaled])
         coefs, *_ = np.linalg.lstsq(design, y_train, rcond=None)
 
@@ -124,12 +158,13 @@ class QuantTradingSystem:
 
     @staticmethod
     def fetch_spot_prices(symbols: list[str]) -> Dict[str, float]:
-        """Get latest spot prices for all tracked symbols in one request."""
+        """批量拉取股票池最新价，返回 {symbol: latest_price}。"""
         spot = ak.stock_zh_a_spot_em()
         rows = spot[spot["代码"].isin(symbols)][["代码", "最新价"]]
         return {str(row["代码"]): float(row["最新价"]) for _, row in rows.iterrows()}
 
     def market_value(self, spot_prices: Dict[str, float]) -> float:
+        """计算持仓市值（未实现盈亏体现在这里）。"""
         holdings = 0.0
         for symbol, pos in self.positions.items():
             price = spot_prices.get(symbol, pos.entry_price)
@@ -137,9 +172,11 @@ class QuantTradingSystem:
         return holdings
 
     def total_equity(self, spot_prices: Dict[str, float]) -> float:
+        """账户总权益 = 现金 + 持仓市值。"""
         return self.cash + self.market_value(spot_prices)
 
     def compute_order_quantity(self, symbol: str, price: float, spot_prices: Dict[str, float]) -> int:
+        """按仓位上限与现金约束计算可买股数（按100股取整）。"""
         equity = self.total_equity(spot_prices)
         target_value = equity * MAX_POSITION_RATIO
         affordable = min(target_value, self.cash)
@@ -147,11 +184,13 @@ class QuantTradingSystem:
         return max(0, lots * LOT_SIZE)
 
     def should_force_sell(self, symbol: str, price: float) -> bool:
+        """是否触发风控卖出（止损/止盈）。"""
         position = self.positions[symbol]
         pnl_pct = (price - position.entry_price) / position.entry_price
         return pnl_pct <= -STOP_LOSS_PCT or pnl_pct >= TAKE_PROFIT_PCT
 
     def place_buy_order(self, symbol: str, price: float, quantity: int) -> None:
+        """执行买入（纸上交易）：更新现金与持仓。"""
         cost = price * quantity
         if quantity <= 0 or cost > self.cash:
             return
@@ -166,6 +205,7 @@ class QuantTradingSystem:
         logging.info("BUY  | symbol=%s qty=%s price=%.2f cost=%.2f cash=%.2f", symbol, quantity, price, cost, self.cash)
 
     def place_sell_order(self, symbol: str, price: float, reason: str) -> None:
+        """执行卖出（纸上交易）：更新现金与已实现盈亏。"""
         position = self.positions.pop(symbol)
         value = price * position.quantity
         pnl = (price - position.entry_price) * position.quantity
@@ -183,6 +223,7 @@ class QuantTradingSystem:
         )
 
     def run(self) -> None:
+        """主循环：行情获取 -> 特征/预测 -> 风控卖出 -> 信号买入 -> 账户汇总。"""
         logging.info(
             "System started. symbols=%s poll_interval=%ss initial_capital=%.2f",
             self.symbols,
@@ -198,7 +239,7 @@ class QuantTradingSystem:
                     time.sleep(self.poll_interval)
                     continue
 
-                predictions: Dict[str, float] = {}
+                predictions: Dict[str, float] = {}  # 本轮预测结果：symbol -> pred_next_ret
                 for symbol in self.symbols:
                     price = spot_prices.get(symbol)
                     if price is None:
@@ -219,7 +260,7 @@ class QuantTradingSystem:
                     predictions[symbol] = pred
                     logging.info("TICK | %s price=%.2f pred_next_ret=%.4f", symbol, price, pred)
 
-                # First: risk exits
+                # 第一步：优先执行风险退出
                 for symbol in list(self.positions.keys()):
                     price = spot_prices.get(symbol)
                     if price is None:
@@ -229,7 +270,7 @@ class QuantTradingSystem:
                     elif predictions.get(symbol, -1.0) < -BUY_SIGNAL_THRESHOLD:
                         self.place_sell_order(symbol, price, reason="model_turn_negative")
 
-                # Second: open best opportunities
+                # 第二步：按预测值从高到低开仓
                 ranked = sorted(predictions.items(), key=lambda item: item[1], reverse=True)
                 for symbol, pred in ranked:
                     if pred < BUY_SIGNAL_THRESHOLD:

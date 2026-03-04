@@ -51,6 +51,30 @@ python quant_trading_system.py
 - `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT`：止损/止盈
 - `BUY_SIGNAL_THRESHOLD`：买入阈值
 
+
+## 关键参数 / 关键方法 / 主要变量说明
+
+### 关键参数（`quant_trading_system.py` 顶部）
+- `INITIAL_CAPITAL`：初始资金，默认 100000（10W）。
+- `MAX_POSITION_RATIO`：单标的最大仓位比例，默认 0.4。
+- `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT`：止损/止盈阈值，默认 3% / 6%。
+- `BUY_SIGNAL_THRESHOLD`：买入信号阈值，预测收益率高于该值才开仓。
+- `MODEL_LOOKBACK_DAYS` / `MIN_TRAIN_SAMPLES`：模型训练窗口与最小样本数。
+
+### 关键方法（`QuantTradingSystem`）
+- `get_history`：获取并标准化历史行情。
+- `build_features`：构建模型特征与监督标签。
+- `predict_next_return`：训练线性模型并给出最新时点预测。
+- `compute_order_quantity`：按仓位和现金约束计算下单股数。
+- `should_force_sell`：按止损/止盈判断是否强制平仓。
+- `run`：主循环，串联数据、预测、交易和风控。
+
+### 主要变量
+- `cash`：可用现金。
+- `positions`：当前持仓字典（`symbol -> Position`）。
+- `realized_pnl`：已实现盈亏（仅平仓后变动）。
+- `predictions`：本轮每个标的的预测收益率。
+
 ## 后续可接入方向
 
 - 对接券商交易 API（在 `place_buy_order` / `place_sell_order` 中实现实盘下单）
