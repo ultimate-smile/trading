@@ -1,2 +1,3 @@
 akshare>=1.14.82
 pandas>=2.0.0
+numpy>=1.24.0
