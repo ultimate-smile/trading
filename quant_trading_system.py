@@ -65,15 +65,28 @@ class BacktestResult:
 
 class BrokerGateway(Protocol):
     def place_order(self, symbol: str, side: str, quantity: int, price: float) -> dict:
+        """券商下单抽象接口。
+
+        参数:
+        - symbol: 股票代码
+        - side: BUY/SELL
+        - quantity: 下单数量（股）
+        - price: 委托价格
+
+        返回:
+        - 券商网关返回的原始响应字典。
+        """
         ...
 
 
 class HttpBrokerGateway:
     def __init__(self, base_url: str, api_key: str) -> None:
+        """初始化 HTTP 实盘网关客户端。"""
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
 
     def place_order(self, symbol: str, side: str, quantity: int, price: float) -> dict:
+        """通过 HTTP 中间层发送下单请求。"""
         import requests
 
         if not self.base_url:
@@ -87,9 +100,11 @@ class HttpBrokerGateway:
 
 class MarketDataProvider(Protocol):
     def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        """获取实时行情，返回 {symbol: latest_price}。"""
         ...
 
     def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        """获取历史K线并标准化为 date/open/high/low/close。"""
         ...
 
 
@@ -98,12 +113,14 @@ class EFinanceDataProvider:
 
     @staticmethod
     def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str:
+        """从候选列名中找到 DataFrame 实际存在的一列。"""
         for c in candidates:
             if c in df.columns:
                 return c
         raise KeyError(f"缺少列，候选={candidates}, 实际={list(df.columns)}")
 
     def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        """获取股票池实时价格（efinance 实现）。"""
         import efinance as ef
 
         # 优先按股票池定向拉取，减少全市场请求导致的JSON解析失败概率
@@ -125,6 +142,7 @@ class EFinanceDataProvider:
         return result
 
     def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        """获取单标的历史日线并映射到统一列名。"""
         import efinance as ef
 
         beg = (start_date or "20180101").replace("-", "")
@@ -149,6 +167,7 @@ class AkshareDataProvider:
     """AkShare 数据源实现（可选备用）。"""
 
     def get_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        """获取股票池实时价格（AkShare 实现）。"""
         import akshare as ak
 
         spot = ak.stock_zh_a_spot_em()
@@ -156,6 +175,7 @@ class AkshareDataProvider:
         return {str(row["代码"]): float(row["最新价"]) for _, row in rows.iterrows()}
 
     def get_history(self, symbol: str, lookback_days: int, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        """获取单标的历史日线并映射到统一列名。"""
         import akshare as ak
 
         if start_date or end_date:
@@ -176,6 +196,7 @@ class AkshareDataProvider:
 
 
 def build_data_provider(name: str) -> MarketDataProvider:
+    """按名称构建数据源实现实例。"""
     if name.lower() == "efinance":
         return EFinanceDataProvider()
     if name.lower() == "akshare":
@@ -184,6 +205,7 @@ def build_data_provider(name: str) -> MarketDataProvider:
 
 
 def _normalize_provider_names(names: list[str]) -> list[str]:
+    """规范化数据源名称（去空白、去重、转小写）。"""
     seen = set()
     out = []
     for n in names:
@@ -208,6 +230,13 @@ class QuantTradingSystem:
         broker: Optional[BrokerGateway] = None,
         data_provider_names: Optional[list[str]] = None,
     ) -> None:
+        """初始化交易系统。
+
+        说明：
+        - 初始化账户状态（cash/positions/realized_pnl）；
+        - 注入模型参数、实盘开关、数据源优先级列表；
+        - 创建缓存，用于行情/历史数据失败时兜底。
+        """
         self.symbols = symbols
         self.poll_interval = poll_interval
         self.initial_capital = float(initial_capital)
@@ -225,6 +254,10 @@ class QuantTradingSystem:
 
     @staticmethod
     def _with_retry(func, *args, **kwargs):
+        """对外部I/O调用执行重试。
+
+        使用指数退避：第 n 次重试等待 `DATA_FETCH_RETRY_DELAY * 2^(n-1)` 秒。
+        """
         last_error: Optional[Exception] = None
         for attempt in range(1, DATA_FETCH_RETRIES + 1):
             try:
@@ -237,10 +270,18 @@ class QuantTradingSystem:
         raise RuntimeError(f"Data fetch failed after retries: {last_error}")
 
     def _iter_providers(self):
+        """按配置顺序返回可用数据源实例，用于故障转移。"""
         for name in _normalize_provider_names(self.data_provider_names):
             yield name, build_data_provider(name)
 
     def get_history(self, symbol: str, lookback_days: int = MODEL_LOOKBACK_DAYS + 120) -> Optional[pd.DataFrame]:
+        """获取单标的历史数据。
+
+        流程：
+        1) 按数据源优先级依次尝试；
+        2) 每个数据源内部带重试；
+        3) 至少满足最小样本长度，否则返回 None。
+        """
         last_error = None
         for provider_name, provider in self._iter_providers():
             try:
@@ -257,6 +298,11 @@ class QuantTradingSystem:
 
     @staticmethod
     def build_features(hist: pd.DataFrame) -> pd.DataFrame:
+        """构建模型因子与监督学习标签。
+
+        因子包括：1日收益、5/10日动量、10日波动率、RSI14；
+        标签为下一交易日收益率 `target_next_ret`。
+        """
         df = hist.copy()
         df["ret_1d"] = df["close"].pct_change(1)
         df["mom_5d"] = df["close"].pct_change(5)
@@ -273,6 +319,7 @@ class QuantTradingSystem:
 
     @staticmethod
     def _predict_linear(train_df: pd.DataFrame, latest_row: pd.Series, feature_cols: list[str]) -> float:
+        """用最小二乘线性回归预测下一日收益率。"""
         x_train = train_df[feature_cols].to_numpy(dtype=float)
         y_train = train_df["target_next_ret"].to_numpy(dtype=float)
         means = x_train.mean(axis=0)
@@ -284,6 +331,7 @@ class QuantTradingSystem:
 
     @staticmethod
     def _predict_xgboost(train_df: pd.DataFrame, latest_row: pd.Series, feature_cols: list[str]) -> Optional[float]:
+        """用 XGBoost 回归预测；若未安装 xgboost 则返回 None。"""
         try:
             from xgboost import XGBRegressor
         except ImportError:
@@ -294,6 +342,10 @@ class QuantTradingSystem:
 
     @staticmethod
     def _predict_lstm_or_transformer(train_df: pd.DataFrame, latest_window: np.ndarray, feature_cols: list[str], model_name: str) -> Optional[float]:
+        """用 LSTM/Transformer 进行序列建模预测。
+
+        说明：该方法依赖 PyTorch；当依赖缺失时返回 None 触发上层回退模型。
+        """
         try:
             import torch
             import torch.nn as nn
@@ -319,16 +371,19 @@ class QuantTradingSystem:
 
         class LSTMRegressor(nn.Module):
             def __init__(self, input_dim: int) -> None:
+                """构造轻量 LSTM 回归头。"""
                 super().__init__()
                 self.lstm = nn.LSTM(input_dim, 32, batch_first=True)
                 self.fc = nn.Linear(32, 1)
 
             def forward(self, z: torch.Tensor) -> torch.Tensor:
+                """前向传播，输出序列末端时刻预测值。"""
                 out, _ = self.lstm(z)
                 return self.fc(out[:, -1, :])
 
         class TransformerRegressor(nn.Module):
             def __init__(self, input_dim: int) -> None:
+                """构造轻量 Transformer Encoder 回归头。"""
                 super().__init__()
                 self.proj = nn.Linear(input_dim, 32)
                 layer = nn.TransformerEncoderLayer(d_model=32, nhead=4, batch_first=True)
@@ -336,6 +391,7 @@ class QuantTradingSystem:
                 self.fc = nn.Linear(32, 1)
 
             def forward(self, z: torch.Tensor) -> torch.Tensor:
+                """前向传播，输出序列末端时刻预测值。"""
                 h = self.proj(z)
                 h = self.encoder(h)
                 return self.fc(h[:, -1, :])
@@ -355,6 +411,11 @@ class QuantTradingSystem:
             return float(model(torch.tensor(latest_window[np.newaxis, :, :], dtype=torch.float32)).item())
 
     def predict_next_return(self, feature_df: pd.DataFrame) -> Optional[float]:
+        """统一模型预测入口。
+
+        会根据 `self.model_name` 调用对应模型，必要时回退到线性模型，
+        返回“最新一行特征”对应的下一日收益预测。
+        """
         clean = feature_df.dropna(subset=self.FEATURE_COLS + ["target_next_ret"]).copy()
         if len(clean) < MIN_TRAIN_SAMPLES:
             return None
@@ -376,6 +437,7 @@ class QuantTradingSystem:
         return self._predict_linear(train_df, latest, self.FEATURE_COLS)
 
     def fetch_spot_prices(self, symbols: list[str]) -> Dict[str, float]:
+        """获取实时行情并在数据源间自动故障转移。"""
         last_error = None
         for provider_name, provider in self._iter_providers():
             try:
@@ -390,6 +452,7 @@ class QuantTradingSystem:
         return {}
 
     def get_history_safe(self, symbol: str) -> Optional[pd.DataFrame]:
+        """安全获取历史数据：失败时回退到本地缓存。"""
         try:
             hist = self.get_history(symbol)
             if hist is not None and not hist.empty:
@@ -400,6 +463,7 @@ class QuantTradingSystem:
             return self.last_history.get(symbol)
 
     def fetch_spot_prices_safe(self, symbols: list[str]) -> Dict[str, float]:
+        """安全获取实时行情：失败时回退到缓存价格。"""
         try:
             prices = self.fetch_spot_prices(symbols)
             if prices:
@@ -413,21 +477,26 @@ class QuantTradingSystem:
             return fallback
 
     def market_value(self, spot_prices: Dict[str, float]) -> float:
+        """计算当前持仓总市值。"""
         return sum(pos.quantity * spot_prices.get(s, pos.entry_price) for s, pos in self.positions.items())
 
     def total_equity(self, spot_prices: Dict[str, float]) -> float:
+        """计算账户总权益 = 现金 + 持仓市值。"""
         return self.cash + self.market_value(spot_prices)
 
     def compute_order_quantity(self, price: float, spot_prices: Dict[str, float]) -> int:
+        """按仓位限制和可用现金计算下单股数（按整手）。"""
         affordable = min(self.total_equity(spot_prices) * MAX_POSITION_RATIO, self.cash)
         return max(0, int(affordable // (price * LOT_SIZE)) * LOT_SIZE)
 
     def should_force_sell(self, symbol: str, price: float) -> bool:
+        """判断是否命中止损或止盈条件。"""
         pos = self.positions[symbol]
         pnl_pct = (price - pos.entry_price) / pos.entry_price
         return pnl_pct <= -STOP_LOSS_PCT or pnl_pct >= TAKE_PROFIT_PCT
 
     def _send_live_order(self, symbol: str, side: str, quantity: int, price: float) -> None:
+        """根据实盘开关发送订单到券商网关。"""
         if not self.enable_live_trading:
             return
         if self.broker is None:
@@ -435,6 +504,7 @@ class QuantTradingSystem:
         logging.info("LIVE_ORDER | %s", self.broker.place_order(symbol=symbol, side=side, quantity=quantity, price=price))
 
     def place_buy_order(self, symbol: str, price: float, quantity: int) -> None:
+        """执行买入流程：下单（可选）+ 更新账户状态。"""
         cost = price * quantity
         if quantity <= 0 or cost > self.cash:
             return
@@ -444,6 +514,7 @@ class QuantTradingSystem:
         logging.info("BUY  | symbol=%s qty=%s price=%.2f cash=%.2f", symbol, quantity, price, self.cash)
 
     def place_sell_order(self, symbol: str, price: float, reason: str) -> None:
+        """执行卖出流程：下单（可选）+ 更新盈亏与现金。"""
         pos = self.positions.pop(symbol)
         self._send_live_order(symbol, "SELL", pos.quantity, price)
         pnl = (price - pos.entry_price) * pos.quantity
@@ -452,6 +523,12 @@ class QuantTradingSystem:
         logging.info("SELL | symbol=%s qty=%s price=%.2f pnl=%.2f reason=%s cash=%.2f", symbol, pos.quantity, price, pnl, reason, self.cash)
 
     def backtest_symbol(self, symbol: str, start_date: str = "2019-01-01", end_date: str = "2024-12-31") -> Optional[BacktestResult]:
+        """执行单标的日线回测。
+
+        回测采用滚动训练-滚动预测方式，输出：
+        - 总收益、年化收益、夏普比率
+        - 最大回撤、胜率、交易次数
+        """
         try:
             hist = None
             last_error = None
@@ -512,6 +589,14 @@ class QuantTradingSystem:
         return BacktestResult(symbol, self.model_name, float(total_return), float(annualized), float(sharpe), float(max_dd), float(win_rate), int(trades))
 
     def run(self) -> None:
+        """系统主循环。
+
+        每个轮询周期执行：
+        1) 获取行情；
+        2) 计算信号；
+        3) 先风控卖出，再择优买入；
+        4) 输出账户状态日志。
+        """
         logging.info("System started. symbols=%s model=%s data_providers=%s live=%s", self.symbols, self.model_name, _normalize_provider_names(self.data_provider_names), self.enable_live_trading)
         while True:
             try:
